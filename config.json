@@ -1,0 +1,12 @@
+{
+  "post_summon_seconds": 5.0,
+  "card_point_ratio": [
+    0.2695,
+    0.5013
+  ],
+  "summon_point_ratio": [
+    0.7676,
+    0.7409
+  ],
+  "button_template_client_width": 1024
+}

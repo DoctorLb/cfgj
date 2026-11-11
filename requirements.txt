@@ -1,0 +1,6 @@
+PyQt5>=5.15.9,<5.16
+pynput>=1.7.6,<2
+pyautogui>=0.9.54,<1
+opencv-python>=4.10,<6
+numpy>=1.26,<3
+Pillow>=10,<14
