@@ -85,7 +85,7 @@
 本机本次使用的命令（项目目录下）：
 
 ```powershell
-& 'C:\Users\libo\AppData\Local\Temp\cf-validation-85c1abda6df24833b9e7e5d4a59bf101\runtime\python.exe' -B 'D:\CF--main\CF--main\tests\test_validation.py'
+& 'C:\Users\<用户名>\AppData\Local\Temp\<验证环境>\runtime\python.exe' -B 'D:\AutoCard\tests\test_validation.py'
 ```
 
 上述临时环境可能被系统清理。Qt 的无窗口测试后端提示缺少随包字体，不影响逻辑测试，但未进行界面视觉验收。

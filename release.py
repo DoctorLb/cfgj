@@ -30,7 +30,7 @@ def is_admin():
 
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 
-GAME_PROCESS = "crossfire.exe"  # 穿越火线进程名
+GAME_PROCESS = "crossfire.exe"  # 游戏进程名
 BUTTON_TEMPLATE_SIZE = (80, 20)  # 召唤Boss按钮模板尺寸
 # 点击位置在游戏客户区中的相对位置（按 1024×768 客户区标定），
 # 窗口移动或缩放后按当前客户区重新换算，不依赖绝对屏幕坐标。
@@ -67,7 +67,7 @@ def _process_image_name(pid):
 
 
 def find_game_window():
-    """返回穿越火线主窗口句柄，找不到返回 None。优先可见、客户区最大的窗口。"""
+    """返回游戏主窗口句柄，找不到返回 None。优先可见、客户区最大的窗口。"""
     if sys.platform != "win32":
         return None
     user32 = ctypes.windll.user32
@@ -307,7 +307,7 @@ class MacroApp(QWidget):
             self.log_signal.emit("[设置] F11循环次数必须大于 0")
             return
         if find_game_window() is None:
-            self.log_signal.emit("[设置] 未找到穿越火线窗口，请先进入游戏再按 F11")
+            self.log_signal.emit("[设置] 未找到游戏窗口，请先进入游戏再按 F11")
             return
         if not focus_game_window():
             self.log_signal.emit("[提示] 未能自动切回游戏窗口，请手动点一下游戏画面")
@@ -357,7 +357,7 @@ class MacroApp(QWidget):
         card = self.card_point()
         summon = self.summon_point()
         if card is None or summon is None:
-            self.note_failure("[设置] 未找到穿越火线窗口，无法换算点击位置，本轮跳过")
+            self.note_failure("[设置] 未找到游戏窗口，无法换算点击位置，本轮跳过")
             return self.run_event.is_set()
         self.safe_click(*card, "卡片")
         if not self.interruptible_sleep(0.3):
@@ -572,7 +572,7 @@ class MacroApp(QWidget):
         try:
             rect = game_client_rect()
             if rect is None:
-                raise RuntimeError("未找到穿越火线窗口，请先进入游戏")
+                raise RuntimeError("未找到游戏窗口，请先进入游戏")
             x, y = map(int, pyautogui.position())
             left, top, width, height = rect
             if not (left <= x < left + width and top <= y < top + height):

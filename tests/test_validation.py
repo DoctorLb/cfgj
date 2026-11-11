@@ -435,7 +435,7 @@ class ValidationTests(unittest.TestCase):
             self.window.start_auto_cycle()
         worker.assert_not_called()
         self.assertFalse(self.window.run_event.is_set())
-        self.assertIn("未找到穿越火线窗口", self.window.log.toPlainText())
+        self.assertIn("未找到游戏窗口", self.window.log.toPlainText())
 
     def test_invalid_count_text_starts_nothing(self):
         self.window.Statistics.setText("abc")
