@@ -1,15 +1,22 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
+
 block_cipher = None
+
+# 怪物模板由使用者按 F8 现场生成，没有时不能让整个打包失败
+datas = [
+    ('config.json', '.'),  # 包含配置文件
+    ('summon_button_custom.png', '.'),  # 召唤Boss按钮模板，缺失会无法识别面板
+]
+if os.path.isfile('monster_template_custom.png'):
+    datas.append(('monster_template_custom.png', '.'))
 
 a = Analysis(
     ['release.py'],  # 替换为你的主脚本文件名
     pathex=[], 
     binaries=[],
-    datas=[
-        ('config.json', '.'),  # 包含配置文件
-        ('summon_button_custom.png', '.'),  # 召唤Boss按钮模板，缺失会无法识别面板
-    ],
+    datas=datas,
     hiddenimports=[
         'pynput.keyboard._win32',  # Windows 系统需要
         'pynput.mouse._win32',

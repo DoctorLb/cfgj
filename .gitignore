@@ -2,9 +2,11 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+.testenv/
 build/
 dist/
 *.log
 debug_region.png
+monster_template_custom.png
 .DS_Store
 Thumbs.db

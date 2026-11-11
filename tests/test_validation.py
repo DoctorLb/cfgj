@@ -58,15 +58,31 @@ class ValidationTests(unittest.TestCase):
     def new_window(self):
         window = release.MacroApp()
         window.custom_button_image = Path.cwd() / "summon_button_custom.png"
+        window.monster_template_image = Path.cwd() / release.MONSTER_TEMPLATE_NAME
         self.windows.append(window)
         return window
+
+    def make_monster_template(self):
+        """一张有明显纹理的假怪物图，供真实 OpenCV 匹配使用。"""
+        from PIL import Image, ImageDraw
+        template = Image.new("RGB", release.MONSTER_TEMPLATE_SIZE, (20, 120, 60))
+        draw = ImageDraw.Draw(template)
+        for col in range(0, release.MONSTER_TEMPLATE_SIZE[0], 6):
+            draw.rectangle((col, 0, col + 3, release.MONSTER_TEMPLATE_SIZE[1] - 1),
+                           fill=(230, 235, 240))
+        draw.ellipse((20, 20, 100, 100), fill=(200, 40, 40))
+        template.save(self.window.monster_template_image)
+        return template
 
     def close_windows(self):
         for window in self.windows:
             window.run_event.clear()
+            window.aim_event.clear()
         for worker in self.workers:
             worker.join(timeout=1)
         for window in self.windows:
+            if window._marker is not None:
+                window._marker.close()
             window.close()
             window.deleteLater()
         QT_APP.processEvents()
@@ -90,7 +106,7 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(self.window.Statistics.text(), "1000")
 
     def test_ui_has_no_removed_features(self):
-        for attr in ("shoot_event", "loop_event", "_exec_lock", "handle_f12",
+        for attr in ("shoot_event", "loop_event", "_exec_lock",
                      "handl_f9", "handle_no_dps", "execute_sequence", "check_image",
                      "start_detection_loop", "save_loop_state", "card_delay_range",
                      "card_delay_min", "card_delay_max"):
@@ -119,6 +135,7 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(set(config), {
             "post_summon_seconds", "card_point_ratio",
             "summon_point_ratio", "button_template_client_width",
+            "aim_gain", "aim_template_client_width",
         })
 
     def test_invalid_stored_waits_fall_back(self):
@@ -221,12 +238,18 @@ class ValidationTests(unittest.TestCase):
         self.window.card_ratio = (0.1, 0.2)
         self.window.summon_ratio = (0.3, 0.4)
         self.window.template_client_width = 800
+        self.window.aim_gain_spin.setValue(2.5)
+        self.make_monster_template()
         self.window.reset_custom_positions()
         self.assertEqual(self.window.card_ratio, release.DEFAULT_CARD_RATIO)
         self.assertEqual(self.window.summon_ratio, release.DEFAULT_SUMMON_RATIO)
         self.assertEqual(self.window.template_client_width, 1024)
+        self.assertEqual(self.window.aim_gain, release.DEFAULT_AIM_GAIN)
         config = json.loads(Path("config.json").read_text(encoding="utf-8"))
         self.assertEqual(config["card_point_ratio"], list(release.DEFAULT_CARD_RATIO))
+        self.assertEqual(config["aim_gain"], release.DEFAULT_AIM_GAIN)
+        # 清除位置只恢复参数，不删除已生成的模板
+        self.assertTrue(self.window.monster_template_image.is_file())
 
     def test_open_panel_is_not_toggled_closed(self):
         with patch.object(self.window, "summon_panel_visible", return_value=True):
@@ -523,6 +546,256 @@ class ValidationTests(unittest.TestCase):
         config = self.window.load_config()
         self.assertEqual(config.get("post_summon_seconds"), 5.0)
         self.assertTrue(config.get("card_point_ratio"))
+
+    # ---------------- 自动瞄准 ----------------
+
+    def test_aim_ui_defaults_and_bounds(self):
+        self.assertEqual(self.window.aim_gain, release.DEFAULT_AIM_GAIN)
+        self.assertEqual(self.window.aim_gain_spin.value(), release.DEFAULT_AIM_GAIN)
+        self.assertEqual(self.window.aim_template_client_width, 1024)
+        self.window.aim_gain_spin.setValue(0.01)
+        self.assertEqual(self.window.aim_gain_spin.value(), release.AIM_GAIN_RANGE[0])
+        self.window.aim_gain_spin.setValue(99)
+        self.assertEqual(self.window.aim_gain_spin.value(), release.AIM_GAIN_RANGE[1])
+
+    def test_invalid_stored_gain_falls_back(self):
+        for value in ("bad", None, True, False, 0, -1, 99, float("nan"), float("inf")):
+            with self.subTest(value=value):
+                Path("config.json").write_text(json.dumps({"aim_gain": value}), encoding="utf-8")
+                self.assertEqual(self.new_window().aim_gain, release.DEFAULT_AIM_GAIN)
+
+    def test_stored_gain_and_aim_width_reload(self):
+        self.window.aim_gain_spin.setValue(1.6)
+        self.window.save_config()
+        reloaded = self.new_window()
+        self.assertEqual(reloaded.aim_gain, 1.6)
+        self.assertEqual(reloaded.aim_gain_spin.value(), 1.6)
+
+    def test_f8_records_monster_crop_and_template_width(self):
+        from PIL import Image
+        self.inputs["position"].return_value = (600, 500)
+        self.inputs["screenshot"].return_value = Image.new("RGB", release.MONSTER_TEMPLATE_SIZE)
+        self.window.capture_custom_position("monster")
+        half = release.MONSTER_TEMPLATE_SIZE[0] // 2
+        self.inputs["screenshot"].assert_called_once_with(
+            region=(600 - half, 500 - half, *release.MONSTER_TEMPLATE_SIZE))
+        self.assertTrue(self.window.monster_template_image.is_file())
+        self.assertEqual(self.window.aim_template_client_width, 1024)
+        config = json.loads(Path("config.json").read_text(encoding="utf-8"))
+        self.assertEqual(config["aim_template_client_width"], 1024)
+        self.assertIn("已记录怪物模板", self.window.log.toPlainText())
+
+    def test_monster_capture_near_edge_is_rejected(self):
+        self.inputs["position"].return_value = (150, 500)
+        self.window.capture_custom_position("monster")
+        self.assertFalse(self.window.monster_template_image.is_file())
+        self.assertIn("边缘太近", self.window.log.toPlainText())
+
+    def test_monster_capture_blocked_while_aiming(self):
+        self.window.aim_event.set()
+        self.window.capture_custom_position("monster")
+        self.inputs["position"].assert_not_called()
+        self.assertIn("先按 F12 停止", self.window.log.toPlainText())
+
+    def test_hotkeys_cover_monster_capture_and_aim_toggle(self):
+        self.window.capture_point_signal.disconnect()
+        self.window.f12_signal.disconnect()
+        requests, toggles = [], []
+        self.window.capture_point_signal.connect(requests.append)
+        self.window.f12_signal.connect(lambda: toggles.append(True))
+        self.window.on_key_press(release.Key.f8)
+        self.window.on_key_press(release.Key.f8)
+        self.window.on_key_release(release.Key.f8)
+        self.window.on_key_press(release.Key.f8)
+        self.window.on_key_press(release.Key.f12)
+        self.window.on_key_press(release.Key.f12)
+        self.assertEqual(requests, ["monster", "monster"])
+        self.assertEqual(toggles, [True])
+
+    def test_aim_once_converts_error_through_gain(self):
+        self.window.aim_event.set()
+        self.window.aim_gain = 2.0
+        center = (612, 434)
+        with patch.object(self.window, "detect_monster",
+                          return_value=(0.9, (center[0] + 40, center[1] - 20))), \
+                patch.object(release, "mouse_relative_move", return_value=True) as move:
+            self.window.aim_once()
+        self.assertEqual(move.call_args.args, (20.0, -10.0))
+
+    def test_aim_once_deadzone_and_step_clamp(self):
+        self.window.aim_event.set()
+        center = (612, 434)
+        with patch.object(release, "mouse_relative_move", return_value=True) as move:
+            with patch.object(self.window, "detect_monster",
+                              return_value=(0.9, (center[0] + 3, center[1] + 2))):
+                self.window.aim_once()
+            move.assert_not_called()
+            with patch.object(self.window, "detect_monster",
+                              return_value=(0.9, (center[0] + 900, center[1] - 500))):
+                self.window.aim_once()
+            cap = release.AIM_MAX_STEP_PX
+            self.assertEqual(move.call_args.args, (float(cap), -float(cap)))
+        self.assertIn(f"已修正 ({cap},{-cap})px", self.window.log.toPlainText())
+
+    def test_aim_once_without_detection_does_not_move(self):
+        self.window.aim_event.set()
+        with patch.object(self.window, "detect_monster", return_value=None), \
+                patch.object(release, "mouse_relative_move", return_value=True) as move:
+            self.window.aim_once()
+        move.assert_not_called()
+
+    def test_aim_input_failure_is_logged_once(self):
+        self.window.aim_event.set()
+        with patch.object(self.window, "detect_monster", return_value=(0.9, (712, 434))), \
+                patch.object(release, "mouse_relative_move", return_value=False) as move:
+            self.window.aim_once()
+        move.assert_called_once()
+        self.assertIn("相对鼠标移动发送失败", self.window.log.toPlainText())
+        self.assertEqual(self.window._aim_input_failures, 1)
+
+    def test_detect_monster_returns_matched_center(self):
+        from PIL import Image
+        template = self.make_monster_template()
+        canvas = Image.new("RGB", (1024, 768), (15, 40, 25))
+        paste = (300, 200)
+        canvas.paste(template, paste)
+        self.inputs["screenshot"].return_value = canvas
+        score, point = self.window.detect_monster()
+        self.assertGreaterEqual(score, release.AIM_SCORE_MIN)
+        half = release.MONSTER_TEMPLATE_SIZE[0] // 2
+        self.assertEqual((round(point[0]), round(point[1])),
+                         (100 + paste[0] + half, 50 + paste[1] + half))
+
+    def test_detect_monster_misses_blank_screen(self):
+        from PIL import Image
+        self.make_monster_template()
+        self.inputs["screenshot"].return_value = Image.new("RGB", (1024, 768), (15, 40, 25))
+        self.assertIsNone(self.window.detect_monster())
+
+    def test_detect_monster_missing_template_raises(self):
+        with self.assertRaisesRegex(RuntimeError, "怪物模板不存在"):
+            self.window.detect_monster()
+
+    def test_end_to_end_aim_moves_crosshair_to_monster(self):
+        from PIL import Image
+        template = self.make_monster_template()
+        canvas = Image.new("RGB", (1024, 768), (15, 40, 25))
+        half = release.MONSTER_TEMPLATE_SIZE[0] // 2
+        paste = (512 + 60 - half, 384 - half)  # 怪物中心在客户区内比准星偏右 60px
+        canvas.paste(template, paste)
+        self.inputs["screenshot"].return_value = canvas
+        self.window.aim_event.set()
+        with patch.object(release, "mouse_relative_move", return_value=True) as move:
+            self.window.aim_once()
+        self.assertEqual(move.call_args.args, (60.0, 0.0))
+
+    def test_start_aim_requires_monster_template(self):
+        with patch.object(release.threading, "Thread") as worker:
+            self.window.start_aim_cycle()
+        worker.assert_not_called()
+        self.assertFalse(self.window.aim_event.is_set())
+        self.assertIn("怪物模板不存在", self.window.log.toPlainText())
+
+    def test_start_aim_refuses_while_card_loop_runs(self):
+        self.make_monster_template()
+        self.window.run_event.set()
+        with patch.object(release.threading, "Thread") as worker:
+            self.window.start_aim_cycle()
+        worker.assert_not_called()
+        self.assertFalse(self.window.aim_event.is_set())
+        self.assertIn("放卡循环正在运行", self.window.log.toPlainText())
+
+    def test_card_loop_refuses_while_aiming(self):
+        self.window.aim_event.set()
+        self.window.Card_statistic = 5
+        with patch.object(release.threading, "Thread") as worker:
+            self.window.start_auto_cycle()
+        worker.assert_not_called()
+        self.assertFalse(self.window.run_event.is_set())
+        self.assertIn("自动瞄准正在运行", self.window.log.toPlainText())
+
+    def test_f12_toggles_aim_and_restores_acceleration(self):
+        self.make_monster_template()
+        with patch.object(release.threading, "Thread") as worker, \
+                patch.object(release, "set_mouse_acceleration") as accel:
+            self.window.handle_f12()
+            self.assertTrue(self.window.aim_event.is_set())
+            self.window.handle_f12()
+        self.assertFalse(self.window.aim_event.is_set())
+        self.assertEqual(worker.call_count, 1)
+        self.assertEqual(worker.call_args.kwargs["target"], self.window.aim_cycle_worker)
+        self.assertEqual([c.args[0] for c in accel.call_args_list], [False, True])
+
+    def test_aim_worker_loops_until_stopped(self):
+        self.window.aim_event.set()
+        calls = []
+
+        def aim():
+            calls.append(1)
+            if len(calls) >= 3:
+                self.window.aim_event.clear()
+
+        with patch.object(self.window, "aim_once", side_effect=aim), \
+                patch.object(self.window, "interruptible_sleep", return_value=True):
+            self.window.aim_cycle_worker()
+        self.assertEqual(len(calls), 3)
+
+    def test_aim_worker_stops_and_restores_on_exception(self):
+        self.window.aim_event.set()
+        with patch.object(self.window, "aim_once", side_effect=RuntimeError("cv boom")), \
+                patch.object(release, "set_mouse_acceleration") as accel:
+            self.window.aim_cycle_worker()
+        self.assertFalse(self.window.aim_event.is_set())
+        self.assertIn("瞄准异常: cv boom", self.window.log.toPlainText())
+        self.assertEqual(accel.call_args_list[-1].args[0], True)
+
+    def test_preview_marker_follows_and_hides(self):
+        self.window.update_target_marker((300, 200), 0.9)
+        self.assertIsNotNone(self.window._marker)
+        self.assertEqual((self.window._marker.x(), self.window._marker.y()),
+                         (300 - release.AIM_MARKER_SIZE[0] // 2,
+                          200 - release.AIM_MARKER_SIZE[1] // 2))
+        self.window.on_preview_toggled(False)
+        self.assertFalse(self.window._marker.isVisible())
+
+    def test_preview_marker_created_only_when_checked(self):
+        from PIL import Image
+        template = self.make_monster_template()
+        canvas = Image.new("RGB", (1024, 768), (15, 40, 25))
+        canvas.paste(template, (300, 200))
+        self.inputs["screenshot"].return_value = canvas
+        self.window.detect_monster()
+        self.assertIsNone(self.window._marker)
+        self.window.aim_preview_check.setChecked(True)
+        self.window.detect_monster()
+        self.assertIsNotNone(self.window._marker)
+
+    def test_aiming_never_clicks_or_moves_cursor_absolutely(self):
+        """瞄准只发送相对移动：任何点击或 SetCursorPos 都会破坏“开枪由玩家控制”。"""
+        from PIL import Image
+        template = self.make_monster_template()
+        canvas = Image.new("RGB", (1024, 768), (15, 40, 25))
+        canvas.paste(template, (500, 300))
+        self.inputs["screenshot"].return_value = canvas
+        self.window.aim_event.set()
+        with patch.object(release, "mouse_relative_move", return_value=True) as move:
+            self.window.aim_once()
+        move.assert_called_once()
+        self.inputs["click"].assert_not_called()
+        self.inputs["moveTo"].assert_not_called()
+        self.inputs["press"].assert_not_called()
+
+    def test_windows_input_struct_layout(self):
+        import ctypes
+        packet = release._WinInput()
+        packet.type = 0
+        packet.ii.mi = release._MouseInput(-120, 60, 0, release.MOUSEEVENTF_MOVE, 0, 0)
+        self.assertEqual(packet.ii.mi.dx, -120)
+        self.assertEqual(packet.ii.mi.dy, 60)
+        self.assertEqual(packet.ii.mi.dwFlags, release.MOUSEEVENTF_MOVE)
+        if sys.maxsize > 2**32:  # 64 位下必须和 Windows INPUT 布局一致，否则 SendInput 会失败
+            self.assertEqual(ctypes.sizeof(release._MouseInput), 32)
+            self.assertEqual(ctypes.sizeof(packet), 40)
 
 
 if __name__ == "__main__":
