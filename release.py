@@ -53,6 +53,16 @@ AIM_GAIN_RANGE = (0.05, 5.0)  # 允许配置的灵敏度增益范围
 DEFAULT_AIM_GAIN = 1.0  # 增益 = 每 1 个鼠标移动计数换算成多少屏幕像素
 MONSTER_TEMPLATE_NAME = "monster_template_custom.png"
 AIM_MARKER_SIZE = (11, 11)  # 目标预览标记边长
+AIM_TEMPLATE_DIR = "templates/aim"  # 样本瞄准模板目录，可放多张 PNG
+AIM_IGNORE_DIR = "templates/ignore"  # 跪姿等不该瞄准的样本目录
+AIM_TEMPLATE_ALPHA_MIN = 8  # 样本 alpha 低于该值视为透明背景
+AIM_VETO_MIN = 0.80  # 忽略样本的最低相似度
+AIM_VETO_MARGIN = 0.05  # 忽略样本还要比瞄准样本高这么多才否决
+AIM_VETO_ROI_PADDING = 80  # 否决检查只在目标周围这么大范围内搜索
+AIM_MAX_TARGETS = 4  # 每个模板每个缩放最多保留几处候选，用于按距离挑选
+AIM_TARGET_STICKY_PX = 40  # 上一目标出现在预测位置附近时优先继续瞄它，避免来回切换
+AIM_SWITCH_SIZE_RATIO = 0.85  # 只有明显更大（更近）的候选才从当前目标切走
+AIM_VETO_MAX_CHECKS = 6  # 每轮最多对几个候选做跪姿否决检查
 MOUSEEVENTF_MOVE = 0x0001
 
 
@@ -79,6 +89,13 @@ class _InputUnion(ctypes.Union):
 
 class _WinInput(ctypes.Structure):
     _fields_ = [("type", ctypes.c_uint32), ("ii", _InputUnion)]
+
+
+def aim_edge_image(gray):
+    """Sobel 边缘图：伤害数字等亮色叠加主要改变亮度，对边缘形状影响小得多。"""
+    sx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    sy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    return np.clip(cv2.magnitude(sx, sy), 0, 255).astype(np.uint8)
 
 
 def _process_image_name(pid):
@@ -237,7 +254,12 @@ class MacroApp(QWidget):
         # 刷怪瞄准：模板与增益独立于放卡配置，客户区宽度单独记录
         self.aim_template_client_width = self.read_positive_int("aim_template_client_width", 1024)
         self.monster_template_image = APP_DIR / MONSTER_TEMPLATE_NAME
+        self.template_root = APP_DIR / "templates"
         self.aim_gain = self.read_bounded_float("aim_gain", DEFAULT_AIM_GAIN, AIM_GAIN_RANGE)
+        self._template_cache = {}
+        self._template_scale_cache = {}
+        self._aim_last_target = None
+        self._aim_last_step = (0.0, 0.0)
         self._aim_thread = None
         self._aim_input_failures = 0
         self._marker = None
@@ -328,6 +350,7 @@ class MacroApp(QWidget):
             "失败自动跳过重试；再按 F11 停止。\n"
             "•F6 记录卡片中心，F7 记录“召唤Boss”按钮中心，取点需在面板打开且未自动运行时进行。\n"
             "•F8 记录怪物模板，F12 开始/停止自动瞄准：识别到怪物后按识别误差发送相对鼠标移动把准星拉到怪物身上，开不开枪由你决定；两个循环不能同时运行。\n"
+            "•也可以把站立怪物 PNG 样本放进 templates/aim，跪姿样本放进 templates/ignore（重启脚本生效），F8 模板优先。\n"
             "启动前请关闭召唤面板，保持游戏在前台。")
         lbl_tip.setWordWrap(True)
         lbl_tip.setStyleSheet("color: #666;""font-family: 'SimSun';" "padding: 12px 0;")
@@ -465,12 +488,15 @@ class MacroApp(QWidget):
         if game_client_rect() is None:
             self.log_signal.emit("[设置] 游戏窗口已最小化或不可用，请还原窗口后再按 F12")
             return
-        if self.monster_template_path() is None:
+        if not self.aim_template_paths():
             self.log_signal.emit(
-                f"[设置] 怪物模板不存在，请在战斗画面把鼠标放到怪物身上按 F8 记录（{self.monster_template_image.name}）")
+                f"[设置] 没有可用的怪物模板：请在战斗画面把鼠标放到怪物身上按 F8 记录，"
+                f"或把 PNG 样本放进 {AIM_TEMPLATE_DIR} 目录")
             return
         self.aim_gain = float(self.aim_gain_spin.value())
         self._aim_input_failures = 0
+        self._aim_last_target = None
+        self._aim_last_step = (0.0, 0.0)
         self.aim_event.set()
         set_mouse_acceleration(False)
         self.log_signal.emit(
@@ -482,6 +508,8 @@ class MacroApp(QWidget):
     def stop_aim_cycle(self):
         self.aim_event.clear()
         set_mouse_acceleration(True)
+        self._aim_last_target = None
+        self._aim_last_step = (0.0, 0.0)
         # 工作线程也可能调用这里，标记只能通过信号回到 GUI 线程处理
         self.aim_target_signal.emit(None, 0.0)
         self.log_signal.emit("[系统] 自动瞄准停止，鼠标加速已恢复")
@@ -509,12 +537,15 @@ class MacroApp(QWidget):
         error_x = point[0] - (rect[0] + rect[2] / 2.0)
         error_y = point[1] - (rect[1] + rect[3] / 2.0)
         if max(abs(error_x), abs(error_y)) <= AIM_DEADZONE_PX:
+            self._aim_last_step = (0.0, 0.0)
             return
         # 怪物出现在区域边缘时误差可能有几百像素，一次拉满会把视角甩飞；
         # 限幅后分几轮收敛，按循环间隔大约 1 秒内就能从最远处拉到准星上。
         step_x = max(-AIM_MAX_STEP_PX, min(AIM_MAX_STEP_PX, error_x))
         step_y = max(-AIM_MAX_STEP_PX, min(AIM_MAX_STEP_PX, error_y))
         if mouse_relative_move(step_x / self.aim_gain, step_y / self.aim_gain):
+            # 镜头会随鼠标平移，下一帧目标大约反向移动这么多，用来预测它还在不在原位
+            self._aim_last_step = (step_x, step_y)
             self.log_image_status("瞄准", True,
                                   f"已修正 ({step_x:.0f},{step_y:.0f})px，相似度 {score:.2f}")
             return
@@ -523,33 +554,243 @@ class MacroApp(QWidget):
             self.log_signal.emit("[错误] 相对鼠标移动发送失败（非 Windows 或输入被拦截），瞄准不会生效")
 
     def detect_monster(self):
-        """在游戏客户区内多尺度匹配怪物模板，命中返回 (相似度, 怪物中心屏幕坐标)。"""
+        """在游戏客户区内匹配怪物模板，按由近到远选一只可瞄准的怪，返回 (相似度, 中心屏幕坐标)。"""
         rect = game_client_rect()
         if rect is None:
             self.log_image_status("怪物", False, "未找到游戏窗口")
             return None
-        template_path = self.monster_template_path()
-        if template_path is None:
-            raise RuntimeError(f"怪物模板不存在: {self.monster_template_image}，请在战斗画面按 F8 记录")
-        template = cv2.imread(str(template_path), cv2.IMREAD_GRAYSCALE)
-        if template is None:
-            raise RuntimeError(f"无法读取怪物模板: {template_path}")
+        paths = self.aim_template_paths()
+        if not paths:
+            raise RuntimeError(
+                f"怪物模板不存在：请在战斗画面按 F8 记录，或把 PNG 样本放进 {AIM_TEMPLATE_DIR} 目录")
         screen = cv2.cvtColor(np.array(pyautogui.screenshot(region=rect)), cv2.COLOR_RGB2GRAY)
-        best, scale, top_left = self._best_template_score(
-            screen, template, rect[2], self.aim_template_client_width)
-        if top_left is None or best < AIM_SCORE_MIN:
-            self.log_image_status("怪物", False, f"最高相似度 {best:.2f}，低于阈值 {AIM_SCORE_MIN:.2f}")
+        screen = aim_edge_image(screen)
+        candidates, best_miss, best_name = self._match_aim_templates(screen, rect[2], paths)
+        if not candidates:
+            if self._preview_enabled:
+                self.aim_target_signal.emit(None, 0.0)
+            if best_name:
+                detail = f"最高相似度 {best_miss:.2f}（{best_name}），低于阈值 {AIM_SCORE_MIN:.2f}"
+            else:
+                detail = "没有可读取的模板文件"
+            self.log_image_status("怪物", False, detail)
             return None
+        chosen = self._pick_target(screen, candidates, rect[2])
+        if chosen is None:
+            if self._preview_enabled:
+                self.aim_target_signal.emit(None, 0.0)
+            return None
+        point = (rect[0] + chosen["center"][0], rect[1] + chosen["center"][1])
+        self.log_image_status(
+            "怪物", True,
+            f"已匹配 {chosen['path'].name} 相似度 {chosen['score']:.2f}"
+            f"（缩放 {chosen['scale']:.2f}，{len(candidates)} 个候选由近到远挑选）"
+            f"中心 ({point[0]:.0f},{point[1]:.0f})")
+        if self._preview_enabled:
+            self.aim_target_signal.emit(point, chosen["score"])
+        self._aim_last_target = {
+            "key": chosen["key"],
+            "center": chosen["center"],
+            "width": chosen["width"],
+        }
+        return chosen["score"], point
+
+    def _pick_target(self, screen, candidates, client_width):
+        """候选已按由近到远排序：跳过跪姿，并尽量沿用上一目标避免准星来回甩。"""
+        accepted, checks = [], 0
+        for hit in candidates:
+            if checks >= AIM_VETO_MAX_CHECKS:
+                break
+            checks += 1
+            if self._target_is_ignored(
+                    screen, hit["loc"], (hit["width"], hit["height"]),
+                    hit["score"], client_width):
+                continue
+            accepted.append(hit)
+        if not accepted:
+            return None
+        best = accepted[0]
+        last = self._aim_last_target
+        if last is not None:
+            predicted_x = last["center"][0] - self._aim_last_step[0]
+            predicted_y = last["center"][1] - self._aim_last_step[1]
+            for hit in accepted:
+                if (abs(hit["center"][0] - predicted_x) <= AIM_TARGET_STICKY_PX
+                        and abs(hit["center"][1] - predicted_y) <= AIM_TARGET_STICKY_PX
+                        and hit["width"] >= best["width"] * AIM_SWITCH_SIZE_RATIO):
+                    return hit
+        return best
+
+    def aim_template_paths(self):
+        """F8 模板优先，其后是 templates/aim 下的样本（按文件名排序）。"""
+        paths = []
+        custom = self.monster_template_path()
+        if custom is not None:
+            paths.append(custom)
+        folder = self.template_dir(AIM_TEMPLATE_DIR)
+        if folder.is_dir():
+            paths.extend(sorted(folder.glob("*.png")))
+        return paths
+
+    def ignore_template_paths(self):
+        folder = self.template_dir(AIM_IGNORE_DIR)
+        return sorted(folder.glob("*.png")) if folder.is_dir() else []
+
+    def template_dir(self, relative):
+        """程序目录的样本优先；单文件 EXE 没带目录时回退到内置资源。"""
+        local = self.template_root / relative
+        if local.is_dir():
+            return local
+        bundled = Path(getattr(sys, "_MEIPASS", "")) / relative
+        return bundled if bundled.is_dir() else local
+
+    def load_aim_template(self, path):
+        """读取模板；透明背景填成均值，这样样本用什么背景抠图都不影响形状比对。"""
+        key = str(path)
+        if key in self._template_cache:
+            return self._template_cache[key]
+        raw = cv2.imread(key, cv2.IMREAD_UNCHANGED)
+        if raw is None:
+            self.log_signal.emit(f"[错误] 无法读取怪物模板: {path.name}")
+            self._template_cache[key] = None
+            return None
+        if raw.ndim == 3 and raw.shape[2] == 4:
+            alpha = raw[..., 3]
+            opaque = alpha > AIM_TEMPLATE_ALPHA_MIN
+            if opaque.any() and not opaque.all():
+                bgr = raw[..., :3].astype(np.float32)
+                filled = bgr.copy()
+                filled[~opaque] = bgr[opaque].mean(axis=0)
+                raw = filled.astype(np.uint8)
+            else:
+                raw = raw[..., :3]
+        template = cv2.cvtColor(raw, cv2.COLOR_BGR2GRAY) if raw.ndim == 3 else raw
+        template = aim_edge_image(template)
+        self._template_cache[key] = template
+        return template
+
+    def _match_aim_templates(self, screen, client_width, paths):
+        """先试上次命中的缩放；没有命中再整屏多尺度扫描。返回按由近到远排好的候选。"""
+        best_miss, best_name = 0.0, ""
+        candidates = []
+        for path in paths:
+            template = self.load_aim_template(path)
+            if template is None:
+                continue
+            key = str(path)
+            cached = self._template_scale_cache.get(key)
+            if cached is None or cached[0] != client_width:
+                continue
+            score, scale, loc = self._best_template_score(
+                screen, template, client_width, self.aim_template_client_width,
+                scales=[cached[1]])
+            if score >= AIM_SCORE_MIN and loc is not None:
+                candidates.append(
+                    self._make_candidate(path, key, template, score, scale, loc))
+            elif score > best_miss:
+                best_miss, best_name = score, path.name
+        if candidates:
+            return self._rank_candidates(candidates), best_miss, best_name
+        for path in paths:
+            template = self.load_aim_template(path)
+            if template is None:
+                continue
+            key = str(path)
+            peaks, best = self._template_peaks(
+                screen, template, client_width, self.aim_template_client_width)
+            if peaks:
+                best_peak = max(peaks, key=lambda peak: peak["score"])
+                self._template_scale_cache[key] = (client_width, best_peak["scale"])
+                candidates.extend(
+                    self._make_candidate(path, key, template, peak["score"],
+                                         peak["scale"], peak["loc"])
+                    for peak in peaks)
+            elif best > best_miss or not best_name:
+                best_miss, best_name = best, path.name
+        return self._rank_candidates(candidates), best_miss, best_name
+
+    @staticmethod
+    def _make_candidate(path, key, template, score, scale, loc):
         height, width = template.shape[:2]
         # 命中可能来自缩放后的模板，中心偏移要按实际参与匹配的尺寸算
         matched_w = max(1, int(round(width * scale)))
         matched_h = max(1, int(round(height * scale)))
-        point = (rect[0] + top_left[0] + matched_w / 2.0, rect[1] + top_left[1] + matched_h / 2.0)
-        self.log_image_status("怪物", True,
-                              f"已匹配 相似度 {best:.2f}（缩放 {scale:.2f}）中心 ({point[0]:.0f},{point[1]:.0f})")
-        if self._preview_enabled:
-            self.aim_target_signal.emit(point, best)
-        return best, point
+        return {
+            "score": score, "path": path, "key": key, "scale": scale,
+            "loc": (int(loc[0]), int(loc[1])),
+            "width": matched_w, "height": matched_h,
+            "center": (loc[0] + matched_w / 2.0, loc[1] + matched_h / 2.0),
+        }
+
+    @staticmethod
+    def _rank_candidates(candidates):
+        """同一只怪可能被多个模板/缩放命中：按中心聚簇去重，再按匹配宽度由近到远排序。"""
+        kept = []
+        for hit in sorted(candidates, key=lambda item: item["score"], reverse=True):
+            duplicate = any(
+                abs(hit["center"][0] - other["center"][0])
+                < 0.5 * min(hit["width"], other["width"])
+                and abs(hit["center"][1] - other["center"][1])
+                < 0.5 * min(hit["height"], other["height"])
+                for other in kept)
+            if not duplicate:
+                kept.append(hit)
+        kept.sort(key=lambda item: (item["width"], item["score"]), reverse=True)
+        return kept
+
+    def _template_peaks(self, screen, template, client_width, reference_width=None):
+        """多尺度扫描并保留多处峰值（匹配得越大说明离得越近），返回 (候选, 最高相似度)。"""
+        height, width = template.shape[:2]
+        peaks, best = [], 0.0
+        for scale in self._template_scales(client_width, width, reference_width):
+            size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
+            if size[0] > screen.shape[1] or size[1] > screen.shape[0]:
+                continue
+            resized = cv2.resize(template, size, interpolation=cv2.INTER_AREA)
+            result = cv2.matchTemplate(screen, resized, cv2.TM_CCOEFF_NORMED)
+            if not result.size:
+                continue
+            work = result
+            for _ in range(AIM_MAX_TARGETS):
+                _, score, _, loc = cv2.minMaxLoc(work)
+                score = float(score)
+                best = max(best, score)
+                if score < AIM_SCORE_MIN:
+                    break
+                peaks.append({"score": score, "scale": scale,
+                              "loc": (int(loc[0]), int(loc[1]))})
+                # 抑制同一只怪附近的次峰，免得一个目标占满所有候选
+                half_w, half_h = size[0] // 2, size[1] // 2
+                left = max(0, loc[0] - half_w)
+                top = max(0, loc[1] - half_h)
+                right = min(work.shape[1], loc[0] + half_w + 1)
+                bottom = min(work.shape[0], loc[1] + half_h + 1)
+                work[top:bottom, left:right] = -1.0
+        return peaks, best
+
+    def _target_is_ignored(self, screen, top_left, size, aim_score, client_width):
+        """目标附近若更像跪姿样本就跳过这只：跪着的怪不能打，没必要把准星拉过去。"""
+        paths = self.ignore_template_paths()
+        if not paths:
+            return False
+        left = max(0, top_left[0] - AIM_VETO_ROI_PADDING)
+        top = max(0, top_left[1] - AIM_VETO_ROI_PADDING)
+        right = min(screen.shape[1], top_left[0] + size[0] + AIM_VETO_ROI_PADDING)
+        bottom = min(screen.shape[0], top_left[1] + size[1] + AIM_VETO_ROI_PADDING)
+        roi = screen[top:bottom, left:right]
+        for path in paths:
+            template = self.load_aim_template(path)
+            if template is None:
+                continue
+            score, _, _ = self._best_template_score(
+                roi, template, client_width, self.aim_template_client_width,
+                stop_score=AIM_VETO_MIN)
+            if score >= AIM_VETO_MIN and score > aim_score + AIM_VETO_MARGIN:
+                self.log_image_status(
+                    "瞄准", False,
+                    f"目标更像跪姿（{path.name} 相似度 {score:.2f}），跳过这只")
+                return True
+        return False
 
     def monster_template_path(self):
         """优先用程序目录的怪物模板（F8 可覆盖），单文件 EXE 同目录没有时回退到内置资源。"""
@@ -713,11 +954,14 @@ class MacroApp(QWidget):
             scales.append(scale)
         return scales
 
-    def _best_template_score(self, screen, template, client_width, reference_width=None):
+    def _best_template_score(self, screen, template, client_width, reference_width=None,
+                             scales=None, stop_score=None):
         """多尺度模板匹配，返回 (最高相似度, 缩放, 最佳匹配左上角)；没有任何结果时左上角为 None。"""
         height, width = template.shape[:2]
+        if scales is None:
+            scales = self._template_scales(client_width, width, reference_width)
         best, best_scale, best_loc = 0.0, 1.0, None
-        for scale in self._template_scales(client_width, width, reference_width):
+        for scale in scales:
             size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
             if size[0] > screen.shape[1] or size[1] > screen.shape[0]:
                 continue
@@ -729,6 +973,8 @@ class MacroApp(QWidget):
             if score > best:
                 best, best_scale = score, scale
                 best_loc = cv2.minMaxLoc(result)[3]
+            if stop_score is not None and best >= stop_score:
+                break
         return best, best_scale, (int(best_loc[0]), int(best_loc[1])) if best_loc is not None else None
 
     def button_template_path(self):
@@ -812,10 +1058,19 @@ class MacroApp(QWidget):
 
     def update_aim_status_label(self):
         template = self.monster_template_image
+        aim_folder = self.template_dir(AIM_TEMPLATE_DIR)
+        aim_count = len(list(aim_folder.glob("*.png"))) if aim_folder.is_dir() else 0
+        ignore_count = len(self.ignore_template_paths())
         if template.is_file():
-            state = f"怪物模板：{template.name}（{self.aim_template_client_width}px 客户区下截取）"
+            state = f"F8 模板：{template.name}（{self.aim_template_client_width}px 客户区下截取）"
+            if aim_count:
+                state += f"；样本 {aim_count} 张"
+        elif aim_count:
+            state = f"样本模板：{aim_count} 张（{AIM_TEMPLATE_DIR}），未使用 F8"
         else:
-            state = "怪物模板：未记录，请在战斗画面把鼠标放到怪物身上按 F8"
+            state = "怪物模板：未记录，请在战斗画面按 F8，或把 PNG 样本放进 templates/aim"
+        if ignore_count:
+            state += f"；忽略样本 {ignore_count} 张"
         self.aim_status_label.setText(
             f"{state}\n增益 {self.aim_gain:.2f} 像素/计数，死区 {AIM_DEADZONE_PX}px，"
             f"单次最多修正 {AIM_MAX_STEP_PX}px；开枪完全由你控制。")
@@ -885,6 +1140,9 @@ class MacroApp(QWidget):
                 "请把鼠标放在怪物身体中央")
         monster = pyautogui.screenshot(region=(x - half_w, y - half_h, *MONSTER_TEMPLATE_SIZE))
         monster.save(self.monster_template_image)
+        key = str(self.monster_template_image)
+        self._template_cache.pop(key, None)
+        self._template_scale_cache.pop(key, None)
         self.aim_template_client_width = width
         self.log_signal.emit(
             f"[设置] 已记录怪物模板 中心=({x},{y}) 尺寸={MONSTER_TEMPLATE_SIZE[0]}×{MONSTER_TEMPLATE_SIZE[1]}，"

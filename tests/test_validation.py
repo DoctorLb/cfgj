@@ -676,6 +676,233 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "怪物模板不存在"):
             self.window.detect_monster()
 
+    def test_start_aim_accepts_sample_templates_without_f8(self):
+        self._write_sample("aim", "stand_test.png", self._sample_image())
+        with patch.object(release.threading, "Thread") as worker, \
+                patch.object(release, "set_mouse_acceleration") as accel:
+            self.window.start_aim_cycle()
+        self.assertTrue(self.window.aim_event.is_set())
+        self.assertEqual(worker.call_count, 1)
+        self.assertEqual(accel.call_args_list[-1].args[0], False)
+        self.window.aim_event.clear()
+
+    def _write_sample(self, kind, name, image):
+        folder = Path(release.APP_DIR) / "templates" / kind
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / name
+        image.save(path)
+        return path
+
+    def _sample_image(self, size=(80, 60)):
+        from PIL import Image, ImageDraw
+        image = Image.new("RGBA", size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((10, 10, size[0] - 10, size[1] - 10), fill=(30, 130, 70, 255))
+        for x in range(14, size[0] - 12, 7):
+            draw.line((x, 12, x, size[1] - 12), fill=(240, 240, 200, 255), width=2)
+        return image
+
+    def test_aim_chooses_nearest_standing_monster(self):
+        """屏幕上同时有多只站姿怪时，先瞄匹配尺寸最大（最近）的那只。"""
+        from PIL import Image
+        template = self.make_monster_template()
+        near = Image.fromarray(release.cv2.resize(
+            release.np.array(template), (180, 180),
+            interpolation=release.cv2.INTER_AREA))
+        # 放大版也存成瞄准样本：两只怪都能被模板命中，只靠远近排序
+        self._write_sample("aim", "stand_near.png", near)
+        canvas = Image.new("RGB", (1024, 768), (15, 40, 25))
+        far_paste = (140, 120)
+        near_paste = (560, 400)
+        canvas.paste(template, far_paste)
+        canvas.paste(near, near_paste)
+        self.inputs["screenshot"].return_value = canvas
+        score, point = self.window.detect_monster()
+        self.assertGreaterEqual(score, release.AIM_SCORE_MIN)
+        self.assertEqual((round(point[0]), round(point[1])),
+                         (CLIENT_RECT[0] + near_paste[0] + 90,
+                          CLIENT_RECT[1] + near_paste[1] + 90))
+
+    def test_aim_skips_ignored_nearest_and_keeps_farther_target(self):
+        """最近的候选被判为跪姿时跳过，继续选更远的站姿候选。"""
+        screen = release.np.zeros((100, 100), dtype=release.np.uint8)
+        candidates = [
+            {"score": 0.90, "path": Path("near.png"), "key": "near", "scale": 1.5,
+             "loc": (10, 20), "width": 180, "height": 180, "center": (100.0, 110.0)},
+            {"score": 0.95, "path": Path("far.png"), "key": "far", "scale": 1.0,
+             "loc": (500, 40), "width": 120, "height": 120, "center": (560.0, 100.0)},
+        ]
+        with patch.object(self.window, "_target_is_ignored",
+                          side_effect=[True, False]) as veto:
+            chosen = self.window._pick_target(screen, candidates, 1024)
+        self.assertEqual(chosen["key"], "far")
+        self.assertEqual(veto.call_count, 2)
+
+    def test_pick_target_keeps_previous_target_when_sizes_are_close(self):
+        """两只怪大小接近时沿用上一目标；明显更大（更近）的才切过去。"""
+        screen = release.np.zeros((50, 50), dtype=release.np.uint8)
+        nearer = {"score": 0.90, "path": Path("near.png"), "key": "near", "scale": 1.5,
+                  "loc": (10, 10), "width": 180, "height": 180,
+                  "center": (100.0, 100.0)}
+        previous = {"score": 0.95, "path": Path("prev.png"), "key": "prev", "scale": 1.0,
+                    "loc": (540, 340), "width": 170, "height": 170,
+                    "center": (625.0, 425.0)}
+        candidates = [nearer, previous]
+        self.window._aim_last_target = {
+            "key": "prev", "center": (625.0, 425.0), "width": 170}
+        self.window._aim_last_step = (0.0, 0.0)
+        self.assertEqual(self.window._pick_target(screen, candidates, 1024)["key"], "prev")
+        # 上一帧镜头已经平移了 100px，预测位置对不上，就不再粘着旧目标
+        self.window._aim_last_step = (100.0, 0.0)
+        self.assertEqual(self.window._pick_target(screen, candidates, 1024)["key"], "near")
+
+    def test_detect_monster_uses_sample_template_without_f8(self):
+        """没有 F8 模板时，templates/aim 里的透明背景样本也能识别。"""
+        from PIL import Image
+        sample = self._sample_image()
+        self._write_sample("aim", "stand_test.png", sample)
+        self.assertFalse(self.window.monster_template_image.exists())
+        canvas = Image.new("RGB", (1024, 768), (200, 190, 120))
+        canvas.paste(sample.convert("RGB"), (420, 260), sample.split()[3])
+        self.inputs["screenshot"].return_value = canvas
+        score, point = self.window.detect_monster()
+        self.assertGreaterEqual(score, release.AIM_SCORE_MIN)
+        self.assertEqual((round(point[0]), round(point[1])), (560, 340))
+
+    def test_aim_scale_cache_reuses_scale_on_next_detect(self):
+        from PIL import Image
+        template = self.make_monster_template()
+        canvas = Image.new("RGB", (1024, 768), (15, 40, 25))
+        canvas.paste(template, (300, 200))
+        self.inputs["screenshot"].return_value = canvas
+        self.window.detect_monster()
+        cached = self.window._template_scale_cache[str(self.window.monster_template_image)]
+        self.assertEqual(cached[0], 1024)
+        with patch.object(self.window, "_best_template_score",
+                          wraps=self.window._best_template_score) as spy:
+            self.window.detect_monster()
+        self.assertEqual(spy.call_args.kwargs["scales"], [cached[1]])
+
+    def test_f8_capture_invalidates_template_cache(self):
+        from PIL import Image
+        self.make_monster_template()
+        key = str(self.window.monster_template_image)
+        self.window._template_cache[key] = "stale"
+        self.window._template_scale_cache[key] = (1024, 1.0)
+        self.inputs["screenshot"].return_value = Image.new(
+            "RGB", release.MONSTER_TEMPLATE_SIZE, (1, 2, 3))
+        self.inputs["position"].return_value = (400, 300)
+        self.window.capture_custom_position("monster")
+        self.assertNotIn(key, self.window._template_cache)
+        self.assertNotIn(key, self.window._template_scale_cache)
+
+    def test_kneel_ignore_sample_blocks_aiming(self):
+        """目标更像跪姿样本时跳过本轮，不把准星拉过去。"""
+        from PIL import Image, ImageDraw
+        template = self.make_monster_template()
+        canvas = Image.new("RGB", (1024, 768), (15, 40, 25))
+        canvas.paste(template, (300, 200))
+        # 大块亮色叠加（模拟血条/伤害数字）会拉低瞄准分数，此时更该相信跪姿样本
+        ImageDraw.Draw(canvas).rectangle((330, 230, 400, 300), fill=(250, 250, 250))
+        self.inputs["screenshot"].return_value = canvas
+        self._write_sample("ignore", "kneel_test.png", canvas.crop((300, 200, 420, 320)))
+        self.window._template_cache.clear()
+        self.window._template_scale_cache.clear()
+        self.window.aim_template_client_width = 1024
+        self.assertIsNone(self.window.detect_monster())
+        self.assertIn("跪姿", self.window.log.toPlainText())
+
+    def test_shipped_samples_distinguish_stand_and_kneel(self):
+        """仓库自带样本：站姿腿能命中站姿截图，跪姿样本不会误否决站姿。"""
+        stand = release.cv2.imread(
+            str(PROJECT / "archive/monster_samples/monster_stand_01.png"),
+            release.cv2.IMREAD_GRAYSCALE)
+        stand_edges = release.aim_edge_image(stand)
+        aim = self.window.load_aim_template(
+            PROJECT / "templates/aim/stand_legs_01.png")
+        score, _, loc = self.window._best_template_score(
+            stand_edges, aim, 1024, 1024, scales=[1.0])
+        self.assertGreaterEqual(score, release.AIM_SCORE_MIN)
+        self.assertEqual(loc, (70, 100))
+        kneel = self.window.load_aim_template(
+            PROJECT / "templates/ignore/kneel_01.png")
+        kneel_score, _, _ = self.window._best_template_score(
+            stand_edges, kneel, 1024, 1024, scales=[1.0])
+        self.assertLess(kneel_score, release.AIM_VETO_MIN)
+
+    def test_shipped_rock_sample_matches_its_source(self):
+        """第二张自带样本（四足石头怪）能独立命中，且不会被跪姿样本误否决。"""
+        import shutil
+        from PIL import Image
+        aim_dir = Path(release.APP_DIR) / "templates" / "aim"
+        aim_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy(PROJECT / "templates/aim/stand_rock_01.png", aim_dir)
+        ignore_dir = Path(release.APP_DIR) / "templates" / "ignore"
+        ignore_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy(PROJECT / "templates/ignore/kneel_01.png", ignore_dir)
+        rock = Image.open(
+            PROJECT / "archive/monster_samples/monster_stand_02.png").convert("RGB")
+        canvas = Image.new("RGB", (1024, 768), (18, 34, 26))
+        paste = (300, 200)
+        canvas.paste(rock, paste)
+        self.inputs["screenshot"].return_value = canvas
+        self.window.aim_template_client_width = 1024
+        score, point = self.window.detect_monster()
+        self.assertGreaterEqual(score, release.AIM_SCORE_MIN)
+        # 样本裁的是 (52,15)-(152,143)，怪物中心 = 粘贴点 + (102,79)
+        self.assertEqual((round(point[0]), round(point[1])),
+                         (CLIENT_RECT[0] + paste[0] + 102, CLIENT_RECT[1] + paste[1] + 79))
+
+    def test_shipped_rock_kneel_sample_vetoes_kneeling_scene(self):
+        """跪地石头怪样本：实机跪姿场景（含准星和枪）过否决线，站立场景不误否决。"""
+        import shutil
+        from PIL import Image
+        ignore_dir = Path(release.APP_DIR) / "templates" / "ignore"
+        ignore_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy(PROJECT / "templates/ignore/kneel_rock_01.png", ignore_dir)
+        kneel = Image.open(
+            PROJECT / "archive/monster_samples/monster_kneel_03.png").convert("RGB")
+        kneel_scene = Image.new("RGB", (1024, 768), (18, 34, 26))
+        kneel_scene.paste(kneel, (350, 250))
+        kneel_edges = release.aim_edge_image(release.cv2.cvtColor(
+            release.np.array(kneel_scene), release.cv2.COLOR_RGB2GRAY))
+        # 样本裁的是 (10,118)-(178,210)，准星和枪都在样本外
+        self.assertTrue(self.window._target_is_ignored(
+            kneel_edges, (360, 368), (168, 92), 0.75, 1024))
+        stand = Image.open(
+            PROJECT / "archive/monster_samples/monster_stand_02.png").convert("RGB")
+        stand_scene = Image.new("RGB", (1024, 768), (18, 34, 26))
+        stand_scene.paste(stand, (300, 200))
+        stand_edges = release.aim_edge_image(release.cv2.cvtColor(
+            release.np.array(stand_scene), release.cv2.COLOR_RGB2GRAY))
+        self.assertFalse(self.window._target_is_ignored(
+            stand_edges, (352, 215), (100, 128), 0.99, 1024))
+
+    def test_shipped_brute_sample_matches_and_is_not_vetoed(self):
+        """布鲁特样本：实机场景（含血条、右侧另一只怪和准星）能命中，且不被跪姿误否决。"""
+        import shutil
+        from PIL import Image
+        aim_dir = Path(release.APP_DIR) / "templates" / "aim"
+        aim_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy(PROJECT / "templates/aim/stand_brute_01.png", aim_dir)
+        ignore_dir = Path(release.APP_DIR) / "templates" / "ignore"
+        ignore_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy(PROJECT / "templates/ignore/kneel_01.png", ignore_dir)
+        shutil.copy(PROJECT / "templates/ignore/kneel_rock_01.png", ignore_dir)
+        brute = Image.open(
+            PROJECT / "archive/monster_samples/monster_stand_03.png").convert("RGB")
+        canvas = Image.new("RGB", (1024, 768), (18, 34, 26))
+        paste = (300, 200)
+        canvas.paste(brute, paste)
+        self.inputs["screenshot"].return_value = canvas
+        self.window.aim_template_client_width = 1024
+        score, point = self.window.detect_monster()
+        self.assertGreaterEqual(score, release.AIM_SCORE_MIN)
+        # 样本裁的是 (10,45)-(180,210)，模板中心 = 粘贴点 + (95,127.5)
+        self.assertEqual((round(point[0]), round(point[1])),
+                         (CLIENT_RECT[0] + paste[0] + 95,
+                          round(CLIENT_RECT[1] + paste[1] + 127.5)))
+
     def test_end_to_end_aim_moves_crosshair_to_monster(self):
         from PIL import Image
         template = self.make_monster_template()
@@ -694,7 +921,7 @@ class ValidationTests(unittest.TestCase):
             self.window.start_aim_cycle()
         worker.assert_not_called()
         self.assertFalse(self.window.aim_event.is_set())
-        self.assertIn("怪物模板不存在", self.window.log.toPlainText())
+        self.assertIn("没有可用的怪物模板", self.window.log.toPlainText())
 
     def test_start_aim_refuses_while_card_loop_runs(self):
         self.make_monster_template()

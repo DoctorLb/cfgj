@@ -11,6 +11,9 @@ datas = [
 ]
 if os.path.isfile('monster_template_custom.png'):
     datas.append(('monster_template_custom.png', '.'))
+# 样本模板随包内置；程序目录存在 templates 时优先用外部的
+if os.path.isdir('templates'):
+    datas.append(('templates', 'templates'))
 
 a = Analysis(
     ['release.py'],  # 替换为你的主脚本文件名
